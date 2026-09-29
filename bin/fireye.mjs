@@ -28,6 +28,12 @@ const maxRequests = Number(arg('max-requests', 300));
 const timeoutMs = Number(arg('timeout-ms', 120000));
 const bankPath = arg('bank') || undefined;
 const yes = !!arg('yes');
+const format = String(arg('format', 'auto'));
+
+if (!['auto', 'anthropic', 'openai'].includes(format)) {
+  console.error(`invalid --format ${format} (auto|anthropic|openai)`);
+  process.exit(1);
+}
 
 if (!base || !key || !models.length) {
   console.error(`Usage: node bin/fireye.mjs --base https://relay.example --key sk-... --models claude-opus-5-5,gpt-5.6 \\
@@ -58,7 +64,7 @@ const semaphore = makeSemaphore(concurrency);
 
 const lanes = await Promise.all(models.map(async (label) => {
   const log = (m) => console.log(`  [${label}] ${m}`);
-  const det = await detectTransport({ base, key, model: label, effort, timeoutMs, log });
+  const det = await detectTransport({ base, key, model: label, effort, timeoutMs, format, log });
   if (det.fatal) {
     log(`transport fatal [${det.probe?.status}] ${(det.probe?.error || '').slice(0, 120)}`);
     return { label, ctx: { format: det.format, thinkingMode: det.thinkingMode }, probe: { status: det.probe?.status, input_tokens: det.probe?.input, error: det.probe?.error }, rounds: [], pooled: null, stats: { requests: 1, ok: 0, empty: 0, errors: 1, latencies: [], statuses: {} }, verdict: { verdict: 'INCONCLUSIVE', reason: `transport fatal: ${det.probe?.status}` } };

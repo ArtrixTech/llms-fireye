@@ -1,8 +1,30 @@
 # devlog
 
-## feat(pi): add /fireye extension for current-model fingerprint test
+## feat(core): implement --format transport override
 
 `(哈希后补)` | 2026-09-29
+
+- **Changes**: `bin/fireye.mjs` 解析并校验 `--format auto|anthropic|openai`（usage 早有声明，实现缺失），传入 `detectTransport`；`lib/transport.mjs` 的 detectTransport 接受 format 覆盖，auto 时维持模型名正则。SKILL.md 补 `--format` 说明。
+- **Reason**: pi 插件需要按 `model.api` 传确切格式；kimi-coding 这类 anthropic 端点 + 非 claude 命名的模型靠名字正则会选错端点。
+- **User feedback**: "别忘了过滤fireye不支持的模型"
+- **Process**: 源码确认 `--format` 此前只出现在 usage 字符串。验证：`--format bogus` 被拒；`--format anthropic` 强制后 k3-256k 报告显示 `anthropic/none`（自动猜测会给 openai）。
+- **Result**: `--format anthropic|openai` 生效；auto 默认行为不变。
+- **Notes**: 覆盖只影响格式选择，thinking 参数阶梯照旧。
+
+## fix(pi): resolve real extension path and filter unsupported model APIs
+
+`(哈希后补)` | 2026-09-29
+
+- **Changes**: `pi-extension/index.ts` 的 EXT_DIR 改经 `fs.realpathSync` 跟随软链（pi 经 `~/.pi/agent/extensions/fireye` 软链加载时 `__dirname` 是软链路径，REPO_ROOT 错算成 extensions 目录，spawn 报 MODULE_NOT_FOUND）；handler 预检 bin/fireye.mjs 存在性；按 `model.api` 白名单过滤（anthropic-messages→anthropic、openai-completions→openai，其余 API 类型 notify 并跳过），格式经 `--format` 显式传给 CLI。README 补支持范围。
+- **Reason**: 用户实测 /fireye 在 kimi-coding/k3-256k 上报 MODULE_NOT_FOUND；并要求过滤 fireye 不支持的模型。
+- **User feedback**: 贴出 k3-256k 上 MODULE_NOT_FOUND 窗口文本；"别忘了过滤fireye不支持的模型"。
+- **Process**: 经软链路径 jiti 导入复现（spawn 路径变成 `~/.pi/agent/extensions/bin/fireye.mjs`）；修复后同路径复测全链路通过；过滤逻辑以 mock ctx 直调 handler 验证（openai-responses 被拒并提示，openai-completions 放行到 auth 阶段）。
+- **Result**: 软链安装可用；不支持的模型给出明确提示；kimi 类 anthropic 端点模型可测。
+- **Notes**: realpathSync 对直接路径安装是恒等操作。
+
+## feat(pi): add /fireye extension for current-model fingerprint test
+
+`0489fc8` | 2026-09-29
 
 - **Changes**: 新增 `pi-extension/index.ts`：`/fireye [rounds]` 命令（默认 1 轮）；从 pi model registry 的 `getApiKeyAndHeaders(model)` 解析当前模型的 baseUrl + apiKey，baseUrl 去尾 `/vN` 适配 fireye 的 `/v1/*` 拼接；key 经 `FIREYE_KEY` env 传给子进程；spawn `bin/fireye.mjs`（concurrency=1），单 overlay 窗口实时日志 → 判定行 → 完整 report.md 滚动查看；Esc 运行中取消/结束后关闭；报告默认落 `reports/`，`FIREYE_PI_OUT` 可改。README/Architecture/SKILL 补插件说明。
 - **Reason**: 快速对 pi 当前选中模型验货，省去手动拼 base URL 与 key。
