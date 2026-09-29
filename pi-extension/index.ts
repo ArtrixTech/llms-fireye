@@ -17,7 +17,10 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-const EXT_DIR = typeof __dirname !== "undefined" ? __dirname : path.dirname(fileURLToPath(import.meta.url));
+// pi loads this file through the ~/.pi/agent/extensions/fireye symlink, so
+// resolve the real path before deriving repo-relative locations.
+const EXT_DIR_RAW = typeof __dirname !== "undefined" ? __dirname : path.dirname(fileURLToPath(import.meta.url));
+const EXT_DIR = fs.realpathSync(EXT_DIR_RAW);
 const REPO_ROOT = path.resolve(EXT_DIR, "..");
 const BIN = path.join(REPO_ROOT, "bin", "fireye.mjs");
 const REPORTS_DIR = process.env.FIREYE_PI_OUT ?? path.join(REPO_ROOT, "reports");
@@ -27,6 +30,12 @@ const MAX_LOG_LINES = 500;
 const VERDICT_RE = /^(.+): (PASS|LIKELY|FAMILY_MATCH|SUSPECT|FAIL|INCONCLUSIVE|LIMITED) — (.+)$/;
 const REPORT_RE = /report → (.+\/report\.md)/;
 
+/** fireye's transport speaks exactly two API shapes. */
+const API_TO_FORMAT: Record<string, "anthropic" | "openai"> = {
+	"anthropic-messages": "anthropic",
+	"openai-completions": "openai",
+};
+
 type RunState = "running" | "done" | "error" | "aborted";
 
 interface RunTarget {
@@ -34,6 +43,7 @@ interface RunTarget {
 	modelId: string;
 	provider: string;
 	rounds: number;
+	format: "anthropic" | "openai";
 	apiKey: string;
 }
 
@@ -63,6 +73,20 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
+			const format = API_TO_FORMAT[model.api as string];
+			if (!format) {
+				ctx.ui.notify(
+					`fireye: ${model.provider}/${model.id} uses API "${model.api}", unsupported by fireye. Testable APIs: anthropic-messages, openai-completions`,
+					"error",
+				);
+				return;
+			}
+
+			if (!fs.existsSync(BIN)) {
+				ctx.ui.notify(`fireye: bin/fireye.mjs not found under ${REPO_ROOT}`, "error");
+				return;
+			}
+
 			const parsed = Number.parseInt((args ?? "").trim(), 10);
 			const rounds = Number.isFinite(parsed) && parsed > 0 ? Math.min(parsed, 20) : 1;
 
@@ -89,6 +113,7 @@ export default function (pi: ExtensionAPI) {
 				modelId: model.id,
 				provider: model.provider,
 				rounds,
+				format,
 				apiKey: auth.apiKey,
 			};
 
@@ -139,11 +164,11 @@ export class FireyeOverlay implements Focusable {
 	}
 
 	private start(): void {
-		const { base, modelId, rounds, apiKey } = this.target;
+		const { base, modelId, rounds, format, apiKey } = this.target;
 		// Key travels via env so it never appears in the process argument list.
 		const child = spawn(
 			"node",
-			[BIN, "--base", base, "--models", modelId, "--rounds", String(rounds), "--concurrency", "1", "--out", REPORTS_DIR],
+			[BIN, "--base", base, "--models", modelId, "--rounds", String(rounds), "--concurrency", "1", "--format", format, "--out", REPORTS_DIR],
 			{ cwd: REPO_ROOT, env: { ...process.env, FIREYE_KEY: apiKey } },
 		);
 		this.child = child;
