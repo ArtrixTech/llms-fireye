@@ -19,6 +19,20 @@ node bin/fireye.mjs \
 
 结果：`reports/<host>-<时间>/report.md`（判定总表）+ `raw.json`（全量证据）。
 
+## pi 插件（/fireye）
+
+`pi-extension/` 是 pi 扩展：对当前选中的模型直接跑指纹鉴定，进度与判定显示在一个 overlay 窗口。
+
+```bash
+ln -s ~/GitHub/llms-fireye/pi-extension ~/.pi/agent/extensions/fireye
+```
+
+或把 `.../llms-fireye/pi-extension/index.ts` 加进 `~/.pi/agent/settings.json` 的 `extensions` 数组。
+
+- `/fireye`：当前模型，1 轮（3 题 + 探针）；`/fireye 3`：3 轮
+- base URL 与 key 从 pi 的 model registry 解析；key 经 `FIREYE_KEY` 环境变量传给子进程，不进进程参数
+- 运行中 Esc 取消；结束后窗口内滚动查看完整 report.md，报告同时落盘 `reports/`（`FIREYE_PI_OUT` 可改输出目录）
+
 ## 为什么可信
 
 - 每模型 9 样本（3 轮 × 3 题），每轮独立归因 + 合并归因，双指标（p 值 + 分布相似度）

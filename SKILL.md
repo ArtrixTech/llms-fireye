@@ -30,6 +30,10 @@ node <本 skill 目录>/bin/fireye.mjs \
 - `--max-requests 300`：成本护栏，超了要 `--yes`
 - key 也可走环境变量 `FIREYE_KEY` / `FIREYE_BASE`
 
+## pi 插件
+
+在 pi 里装了 `pi-extension/` 扩展后，对当前选中模型直接 `/fireye`（默认 1 轮）或 `/fireye 3`，结果在 overlay 窗口展示。安装见 README「pi 插件」一节。
+
 ## 读报告
 
 输出在 `reports/<host>-<时间戳>/report.md`（判定总表）+ `raw.json`（全量证据）。判定含义：
