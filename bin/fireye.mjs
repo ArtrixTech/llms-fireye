@@ -30,14 +30,14 @@ const bankPath = arg('bank') || undefined;
 const yes = !!arg('yes');
 const format = String(arg('format', 'auto'));
 
-if (!['auto', 'anthropic', 'openai'].includes(format)) {
-  console.error(`invalid --format ${format} (auto|anthropic|openai)`);
+if (!['auto', 'anthropic', 'openai', 'openai-responses'].includes(format)) {
+  console.error(`invalid --format ${format} (auto|anthropic|openai|openai-responses)`);
   process.exit(1);
 }
 
 if (!base || !key || !models.length) {
   console.error(`Usage: node bin/fireye.mjs --base https://relay.example --key sk-... --models claude-opus-5-5,gpt-5.6 \\
-  [--rounds 3] [--concurrency 2] [--delay-ms 0] [--effort medium] [--format auto] [--timeout-ms 120000] \\
+  [--rounds 3] [--concurrency 2] [--delay-ms 0] [--effort medium] [--format auto|anthropic|openai|openai-responses] [--timeout-ms 120000] \\
   [--max-requests 300] [--out reports] [--bank path] [--yes]`);
   process.exit(1);
 }

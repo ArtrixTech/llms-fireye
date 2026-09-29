@@ -26,7 +26,7 @@ node <本 skill 目录>/bin/fireye.mjs \
 - `--concurrency`：全局并发上限。有并发限制的站用 1-2，无限流的站可以开到模型数（每条 lane 内部串行，lane 之间并行）
 - `--rounds 3`：每模型 3 轮 × 3 题 = 9 个样本（默认，置信度足够）
 - `--delay-ms`：站上有机型 RPM 限制时加间隔
-- `--format auto`：传输格式。auto 按模型名猜（claude/opus/sonnet/haiku → anthropic，其余 → openai）；anthropic 端点 + 非 claude 命名的模型（如 kimi）用 `--format anthropic` 强制
+- `--format auto`：传输格式。auto 按模型名猜（claude/opus/sonnet/haiku → anthropic，其余 → openai chat completions）；可强制 `anthropic` / `openai` / `openai-responses`（/v1/responses）。anthropic 端点 + 非 claude 命名的模型（如 kimi）用 `--format anthropic`
 - `--effort medium`：thinking 档位（anthropic adaptive / openai reasoning_effort 自动适配，400 时自动沿参数阶梯降级）
 - `--max-requests 300`：成本护栏，超了要 `--yes`
 - key 也可走环境变量 `FIREYE_KEY` / `FIREYE_BASE`
