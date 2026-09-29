@@ -31,8 +31,10 @@ ln -s ~/GitHub/llms-fireye/pi-extension ~/.pi/agent/extensions/fireye
 
 - `/fireye`：当前模型，1 轮（3 题 + 探针）；`/fireye 3`：3 轮
 - base URL 与 key 从 pi 的 model registry 解析；key 经 `FIREYE_KEY` 环境变量传给子进程，不进进程参数
-- 运行中 Esc 取消；结束后窗口内滚动查看完整 report.md，报告同时落盘 `reports/`（`FIREYE_PI_OUT` 可改输出目录）
-- 仅支持 `anthropic-messages` 与 `openai-completions` 端点的模型；其他 API 类型（openai-responses、google、bedrock 等）会直接提示并跳过。格式按 `model.api` 显式传给 CLI，kimi 这类 anthropic 端点 + 非 claude 命名的模型也能测
+- 运行中 Esc 取消；报告同时落盘 `reports/`（`FIREYE_PI_OUT` 可改输出目录）
+- 支持 `anthropic-messages`、`openai-completions`、`openai-responses` 端点；google、bedrock 等其余 API 类型直接提示并跳过。格式按 `model.api` 显式传给 CLI，kimi 这类 anthropic 端点 + 非 claude 命名的模型也能测
+- 模型名需在 ModelTrace 指纹库内（gpt-5.4/5.5/5.6-*/6-*、claude-haiku-4-5 到 claude-opus-5-5 共 16 个），未覆盖的名字直接提示并列出清单
+- 结果页是中文一句话判定（✅ 真身 / ❌ 假冒 / 🟡 同家族换壳 等）+ 归因/置信度/注入/可靠性，Tab 切换完整报告
 
 ## 为什么可信
 

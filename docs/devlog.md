@@ -1,8 +1,29 @@
 # devlog
 
-## feat(core): implement --format transport override
+## feat(pi): bank-name filter and human-readable verdict view
 
 `(哈希后补)` | 2026-09-29
+
+- **Changes**: `pi-extension/index.ts` 过滤从 API 白名单改为指纹库模型名覆盖检查（动态 import lib/bank.mjs 的 loadBank，模块级缓存；精确 + 归一化（小写/去日期尾缀）匹配；未覆盖直接提示并列出支持的 16 个模型名）；协议映射扩为 anthropic-messages/openai-completions/openai-responses；done 视图改为中文一句话判定（✅真身/🟢大概率真身/🟡同家族换壳/🟠混池嫌疑/❌假冒/⚪无法判定）+ 归因 top1/p/sim/注入估算/自报身份/可靠性/协议/依据，数据源从 stdout 文本改为解析 raw.json；Tab 切换完整 report.md。README 更新。
+- **Reason**: 用户反馈英文 verdict 原文 + 整篇报告不可读，且过滤依据应是指纹库模型名。
+- **User feedback**: "这tm根本人类读不懂啊"（LIMITED 原文窗口）；"结果需要人类可读…直接告诉我当前是否是真实模型即可，要加上颜色/indicator"；"需要你过滤的是模型名称（上游有写，指纹库支持的模型名称）…response也应该要支持啊"。
+- **Process**: jiti 冒烟全过：claude-fable-5-1 被拦并列出清单、claude-opus-5-5 放行、openai-responses 放行、google 被拦；真实 PASS raw.json 渲染摘要视图 + Tab 切换 + 关闭摘要均符合预期。
+- **Result**: /fireye 结果一页读懂；名字不在库直接拒跑。
+- **Notes**: 状态行完成时带判定图标；关闭后 notify 带 icon + 中文判定 + p 值。
+
+## feat(core): support openai-responses transport
+
+`(哈希后补)` | 2026-09-29
+
+- **Changes**: `lib/transport.mjs` 新增 openai-responses 格式（/v1/responses，reasoning effort 阶梯，output_text/reasoning summary 解析，usage input/output_tokens；effort 模式 max_output_tokens 下限 1024）；`bin/fireye.mjs` --format 校验与 usage 串同步。SKILL.md 补说明。
+- **Reason**: 用户要求 responses 协议也支持（"response也应该要支持啊"）。
+- **Process**: 本地 mock /v1/responses 服务器跑通整条 lane（transport accepted、探针 200、3 挑战解析、归因出判定）；首轮全空是 mock 脚本探针启发式误判（挑战 prompt 不足 500 字），修正后通过。
+- **Result**: openai-responses 端点可测，与 chat completions 同流程。
+- **Notes**: mock 伪随机数被归因到 claude 是数据无意义所致，传输层验证不受影响。
+
+## feat(core): implement --format transport override
+
+`4fd4c28` | 2026-09-29
 
 - **Changes**: `bin/fireye.mjs` 解析并校验 `--format auto|anthropic|openai`（usage 早有声明，实现缺失），传入 `detectTransport`；`lib/transport.mjs` 的 detectTransport 接受 format 覆盖，auto 时维持模型名正则。SKILL.md 补 `--format` 说明。
 - **Reason**: pi 插件需要按 `model.api` 传确切格式；kimi-coding 这类 anthropic 端点 + 非 claude 命名的模型靠名字正则会选错端点。
@@ -13,7 +34,7 @@
 
 ## fix(pi): resolve real extension path and filter unsupported model APIs
 
-`(哈希后补)` | 2026-09-29
+`149f019` | 2026-09-29
 
 - **Changes**: `pi-extension/index.ts` 的 EXT_DIR 改经 `fs.realpathSync` 跟随软链（pi 经 `~/.pi/agent/extensions/fireye` 软链加载时 `__dirname` 是软链路径，REPO_ROOT 错算成 extensions 目录，spawn 报 MODULE_NOT_FOUND）；handler 预检 bin/fireye.mjs 存在性；按 `model.api` 白名单过滤（anthropic-messages→anthropic、openai-completions→openai，其余 API 类型 notify 并跳过），格式经 `--format` 显式传给 CLI。README 补支持范围。
 - **Reason**: 用户实测 /fireye 在 kimi-coding/k3-256k 上报 MODULE_NOT_FOUND；并要求过滤 fireye 不支持的模型。
