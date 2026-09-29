@@ -1,8 +1,27 @@
 # devlog
 
-## feat(pi): bank-name filter and human-readable verdict view
+## fix(pi): repair report scrolling, freeze timer, live progress
 
 `(哈希后补)` | 2026-09-29
+
+- **Changes**: `pi-extension/index.ts` 四项修复。滚动：窗口内容高度改用 `contentViewH() = floor(0.85*rows) - 8`，保证总行数低于 pi overlay 的 maxHeight 硬裁剪线（pi-tui 对超出部分 `slice(0, maxHeight)`，此前高终端下提示行与底部内容被裁掉且永远滚不到）；handleInput 与 render 共用同一视高。计时：done/aborted/error 时 `stopClock()` 记 finishedAt 并停 500ms interval，elapsed 冻结。摘要行序：自报身份移到可靠性下面。实时反馈：running 状态行显示“响应 N/轮×3”计数（解析 runner 新增的成功行）。
+- **Reason**: 用户四条反馈：完整报告无法滚动、自报身份位置、完成后计时还在涨、测试过程无实时进度。
+- **Process**: jiti 冒烟模拟 rows=24/30/50/66/80 验证输出行数始终低于裁剪线；100 行假报告模拟 200 次 ↓ 直达末行再回顶；done 后 1.2s 两次渲染 elapsed 不变；进度计数“响应 2/9”正确显示。
+- **Result**: 报告可滚到底、计时冻结、进度可见。
+- **Notes**: 根因证据在 pi-tui tui.js L925 `overlayLines.slice(0, maxHeight)`。
+
+## feat(core): log per-request challenge progress
+
+`(哈希后补)` | 2026-09-29
+
+- **Changes**: `lib/runner.mjs` 挑战循环加索引，每个挑战成功即打 `r{轮}.{题} ✓ {chars} chars in {s}s`，失败打状态与 retrying；末次失败后不再白睡 2.5s。
+- **Reason**: 用户要求每次模型返回都有实时反馈；此前 CLI 只在整轮结束才出日志，一轮三次挑战最长 90s 无动静。
+- **Process**: mock /v1/responses 服务器整条 lane 复跑，r1.1/r1.2/r1.3 逐条输出。
+- **Result**: 每次响应即时可见，pi 插件状态行计数依赖此格式。
+
+## feat(pi): bank-name filter and human-readable verdict view
+
+`3c2ee83` | 2026-09-29
 
 - **Changes**: `pi-extension/index.ts` 过滤从 API 白名单改为指纹库模型名覆盖检查（动态 import lib/bank.mjs 的 loadBank，模块级缓存；精确 + 归一化（小写/去日期尾缀）匹配；未覆盖直接提示并列出支持的 16 个模型名）；协议映射扩为 anthropic-messages/openai-completions/openai-responses；done 视图改为中文一句话判定（✅真身/🟢大概率真身/🟡同家族换壳/🟠混池嫌疑/❌假冒/⚪无法判定）+ 归因 top1/p/sim/注入估算/自报身份/可靠性/协议/依据，数据源从 stdout 文本改为解析 raw.json；Tab 切换完整 report.md。README 更新。
 - **Reason**: 用户反馈英文 verdict 原文 + 整篇报告不可读，且过滤依据应是指纹库模型名。
@@ -13,7 +32,7 @@
 
 ## feat(core): support openai-responses transport
 
-`(哈希后补)` | 2026-09-29
+`8109c07` | 2026-09-29
 
 - **Changes**: `lib/transport.mjs` 新增 openai-responses 格式（/v1/responses，reasoning effort 阶梯，output_text/reasoning summary 解析，usage input/output_tokens；effort 模式 max_output_tokens 下限 1024）；`bin/fireye.mjs` --format 校验与 usage 串同步。SKILL.md 补说明。
 - **Reason**: 用户要求 responses 协议也支持（"response也应该要支持啊"）。

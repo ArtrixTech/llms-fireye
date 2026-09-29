@@ -218,6 +218,7 @@ export class FireyeOverlay implements Focusable {
 	private lane: Lane | undefined;
 	private view: "summary" | "report" = "summary";
 	private errorMsg: string | undefined;
+	private finishedAt: number | undefined;
 	private scroll = 0;
 	private startedAt = Date.now();
 	private child: ChildProcess | undefined;
@@ -276,12 +277,14 @@ export class FireyeOverlay implements Focusable {
 			clearTimeout(watchdog);
 			this.state = "error";
 			this.errorMsg = err.message;
+			this.stopClock();
 			this.tui.requestRender();
 		});
 
 		child.on("close", (code) => {
 			clearTimeout(watchdog);
 			this.child = undefined;
+			this.stopClock();
 			if (this.state === "running") {
 				if (code === 0) this.state = "done";
 				else {
@@ -311,6 +314,7 @@ export class FireyeOverlay implements Focusable {
 			if (this.state === "running") {
 				this.child?.kill("SIGINT");
 				this.state = "aborted";
+				this.stopClock();
 				this.tui.requestRender();
 				return;
 			}
@@ -329,7 +333,7 @@ export class FireyeOverlay implements Focusable {
 		}
 
 		const content = this.contentLines();
-		const viewH = this.viewHeight();
+		const viewH = this.contentViewH();
 		const maxScroll = Math.max(0, content.length - viewH);
 		if (matchesKey(data, "up") || data === "k") {
 			this.scroll = Math.max(0, this.scroll - 1);
@@ -345,8 +349,16 @@ export class FireyeOverlay implements Focusable {
 		this.tui.requestRender();
 	}
 
+	private stopClock(): void {
+		this.finishedAt ??= Date.now();
+		if (this.timer) {
+			clearInterval(this.timer);
+			this.timer = undefined;
+		}
+	}
+
 	private finish(): void {
-		if (this.timer) clearInterval(this.timer);
+		this.stopClock();
 		const lane = this.lane;
 		const pathNote = this.reportPath ? ` — ${this.reportPath}` : "";
 		if (lane?.verdict) {
@@ -385,14 +397,14 @@ export class FireyeOverlay implements Focusable {
 
 		const inj = lane.probe?.injection_estimate;
 		if (inj != null) out.push({ c: "text", t: `注入估算  ${inj} tok（"hi" 实际 input ${lane.probe?.input_tokens ?? "?"} tok）` });
-		const self = (lane.harness?.self_report || lane.probe?.self_report || "").replace(/\n+/g, " ").slice(0, 60);
-		if (self) out.push({ c: "dim", t: `自报身份  "${self}"（注入词台词，仅线索）` });
 
 		const st = lane.stats;
 		if (st) {
 			const p50 = st.p50_ms != null ? ` · p50 ${(st.p50_ms / 1000).toFixed(1)}s` : "";
 			out.push({ c: "text", t: `可靠性    ${st.ok}/${st.requests} 成功 · ${st.empty} 空响应 · ${st.errors} 错误${p50}` });
 		}
+		const self = (lane.harness?.self_report || lane.probe?.self_report || "").replace(/\n+/g, " ").slice(0, 60);
+		if (self) out.push({ c: "dim", t: `自报身份  "${self}"（注入词台词，仅线索）` });
 		if (lane.ctx) out.push({ c: "dim", t: `协议      ${lane.ctx.format}/${lane.ctx.thinkingMode}` });
 		out.push({ c: "dim", t: `依据      ${lane.verdict.reason}` });
 		if (this.reportPath) out.push({ c: "dim", t: `报告      ${this.reportPath}` });
@@ -405,10 +417,12 @@ export class FireyeOverlay implements Focusable {
 		return this.summaryLines().map((l) => l.t);
 	}
 
-	private viewHeight(): number {
+	private contentViewH(): number {
 		const rows = process.stdout.rows || 24;
-		// chrome: border 2 + title 1 + status 1 + hint 1 + breathing room
-		return Math.max(8, rows - 10);
+		// The overlay container hard-clips render output to maxHeight (85% of
+		// terminal rows). Keep total emitted lines under the cap: content +
+		// 6 chrome lines (borders, title, status, blank, hint) + 2 spare.
+		return Math.max(5, Math.floor(0.85 * rows) - 8);
 	}
 
 	render(width: number): string[] {
@@ -440,9 +454,12 @@ export class FireyeOverlay implements Focusable {
 		const title = ` 🔥 fireye · ${th.fg("accent", `${t.provider}/${t.modelId}`)} · rounds=${t.rounds} · ${th.fg("dim", t.base)}`;
 		lines.push(row(title));
 
-		const elapsed = Math.floor((Date.now() - this.startedAt) / 1000);
+		const elapsed = Math.floor(((this.finishedAt ?? Date.now()) - this.startedAt) / 1000);
 		let status: string;
-		if (this.state === "running") status = ` ${th.fg("warning", "● 测试中")} ${elapsed}s · Esc 取消`;
+		if (this.state === "running") {
+			const doneCount = this.logLines.filter((l) => /r\d+\.\d+ ✓/.test(l)).length;
+			status = ` ${th.fg("warning", "● 测试中")} ${elapsed}s · 响应 ${doneCount}/${t.rounds * 3} · Esc 取消`;
+		}
 		else if (this.state === "done") {
 			const s = this.lane?.verdict ? verdictStyle(this.lane.verdict.verdict) : undefined;
 			status = ` ${th.fg("success", "● 完成")} ${elapsed}s${s ? ` · ${s.icon} ${th.fg(s.color, s.label)}` : ""}`;
@@ -451,7 +468,7 @@ export class FireyeOverlay implements Focusable {
 		lines.push(row(status));
 		lines.push(row(""));
 
-		const viewH = this.viewHeight() - 2; // title + status + blank already emitted
+		const viewH = this.contentViewH();
 		if (this.state === "running") {
 			const slice = this.logLines.slice(-Math.max(1, viewH));
 			for (const l of slice) lines.push(row(` ${th.fg("dim", l)}`));
