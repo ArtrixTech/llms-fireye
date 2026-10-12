@@ -1,8 +1,19 @@
 # devlog
 
+## feat: per-answer dilution test with calibrated flag and drift counts
+
+`9795fc9`（代码）+ `4372aa7`（文档）| 2026-10-12
+
+- **Changes**: 产品重定义为“这条通道有没有掺水、掺了多少”。结论收敛为 CLEAN/SUSPECT/MISMATCH/INCONCLUSIVE/UNVERIFIED。新增 `lib/attribution.mjs`：逐条回答三分类（✗ p_label<tau / ≈ 最像别的模型 / ✓），两个计数检验 k≥k*、j≥j*（各 1% 误报，合计 ≤2%），k*/j* 按标签、按 n 从 `lib/calibration.json` 读取。runner 改为信号量全并行，深度 quick=9/deep=30，`--samples` 3–41；删除身份/harness 探针（`lib/probes.mjs`），取证笔记移到 `docs/FORENSICS.md`；TIMEOUT/FETCH_ERROR/401/403/429 视为致命错误。pi 界面：偏离回答显示黄色 ≈ 行，状态行显示 j/n 与可疑线。vendor/modeltrace 子模块指向 fork `f1b531e`（per_response 概率 + 5 个 Ollama 开源模型入库，共 23 模型 828 条）。新增 `scripts/calibrate.mjs`、`replay-reports.mjs`、`check-dup.mjs`。
+- **Reason**: 用户最关心假阴性，尤其库外模型冒充库内；旧结论集难懂；某中转站的 opus-5-5 deep 跑出 3/30 条像别的模型却只显示“未发现掺水”。
+- **User feedback**: “我更关心的是假阴性问题”；“用好奥卡姆剃刀…重点关注假阴性（用了库外的模型判定成库内）”；“为啥都好几个不对劲了也提示没有掺水？”→ 批准“1+2”（界面显示偏离 + 偏离计数检验）。
+- **Process**: ModelTrace 留一模型模拟库（`research/fn_banks.py --lomo`）→ `calibrate.mjs` 网格搜 tau、三项分布算 k/j 联合误报；全部历史报告 replay 结论不变；合成 9/30 偏离 → SUSPECT“偏离太多”；jiti 渲染 pi overlay 冒烟。
+- **Result**: 模拟误报 n=9 1.1%、n=30 0.8%。掺水 25% 时检出率：库内 86%/99%，库外 74%/93%（n=9/30）。
+- **Notes**: 最弱情形是同家族近亲（库外 claude-opus-5 冒充 opus-4-8 100% 判干净）。Ollama Cloud 额度用尽，还有 10 个开源模型未采集。误报率只在模拟里验证过，未用真实正品通道验证。
+
 ## fix(pi): repair report scrolling, freeze timer, live progress
 
-`(哈希后补)` | 2026-09-29
+`f2890af` | 2026-09-29
 
 - **Changes**: `pi-extension/index.ts` 四项修复。滚动：窗口内容高度改用 `contentViewH() = floor(0.85*rows) - 8`，保证总行数低于 pi overlay 的 maxHeight 硬裁剪线（pi-tui 对超出部分 `slice(0, maxHeight)`，此前高终端下提示行与底部内容被裁掉且永远滚不到）；handleInput 与 render 共用同一视高。计时：done/aborted/error 时 `stopClock()` 记 finishedAt 并停 500ms interval，elapsed 冻结。摘要行序：自报身份移到可靠性下面。实时反馈：running 状态行显示“响应 N/轮×3”计数（解析 runner 新增的成功行）。
 - **Reason**: 用户四条反馈：完整报告无法滚动、自报身份位置、完成后计时还在涨、测试过程无实时进度。
@@ -12,7 +23,7 @@
 
 ## feat(core): log per-request challenge progress
 
-`(哈希后补)` | 2026-09-29
+`ae24ec9` | 2026-09-29
 
 - **Changes**: `lib/runner.mjs` 挑战循环加索引，每个挑战成功即打 `r{轮}.{题} ✓ {chars} chars in {s}s`，失败打状态与 retrying；末次失败后不再白睡 2.5s。
 - **Reason**: 用户要求每次模型返回都有实时反馈；此前 CLI 只在整轮结束才出日志，一轮三次挑战最长 90s 无动静。
