@@ -1,13 +1,14 @@
 /**
- * llms-fireye pi extension — /fireye [rounds]
+ * llms-fireye pi extension — /fireye [quick|deep|N]
  *
- * Runs a fingerprint authenticity test against the currently selected model
- * (provider base URL + API key resolved from pi's model registry) and shows
- * a plain-language, color-coded verdict in a single overlay window.
- * Default: 1 round. Tab toggles the full raw report.
+ * Tests whether the currently selected model (provider base URL + API key from pi's model
+ * registry) is what it claims, or a diluted mix. Every answer is scored as it arrives and shown
+ * live; the result page says in plain words what was found and how much dilution the sample
+ * size could have caught.
  *
- * Only model names covered by the ModelTrace fingerprint bank are testable;
- * the handler checks coverage up front and lists the supported names.
+ *   /fireye        quick: 9 answers, all in parallel
+ *   /fireye deep   30 answers (catches lower dilution rates)
+ *   /fireye 15     custom answer count (3–41)
  *
  * Install:
  *   ln -s ~/GitHub/llms-fireye/pi-extension ~/.pi/agent/extensions/fireye
@@ -28,11 +29,11 @@ const EXT_DIR = fs.realpathSync(EXT_DIR_RAW);
 const REPO_ROOT = path.resolve(EXT_DIR, "..");
 const BIN = path.join(REPO_ROOT, "bin", "fireye.mjs");
 const REPORTS_DIR = process.env.FIREYE_PI_OUT ?? path.join(REPO_ROOT, "reports");
-const OVERALL_TIMEOUT_MS = 10 * 60 * 1000;
-const MAX_LOG_LINES = 500;
-
-const VERDICT_RE = /^(.+): (PASS|LIKELY|FAMILY_MATCH|SUSPECT|FAIL|INCONCLUSIVE|LIMITED) — (.+)$/;
-const REPORT_RE = /report → (.+\/report\.md)/;
+const DEPTHS: Record<string, number> = { quick: 9, deep: 30 };
+const MAX_CONCURRENCY = 10;
+/** One answer may take up to 5 min and is retried twice. */
+const ANSWER_BUDGET_MS = 3 * 5 * 60 * 1000;
+const EVENT_PREFIX = "@@fireye ";
 
 /** fireye's transport speaks exactly these API shapes. */
 const API_TO_FORMAT: Record<string, string> = {
@@ -41,24 +42,15 @@ const API_TO_FORMAT: Record<string, string> = {
 	"openai-responses": "openai-responses",
 };
 
-interface VerdictStyle {
-	icon: string;
-	label: string;
-	color: "success" | "warning" | "error" | "dim";
-}
-const VERDICT_ZH: Record<string, VerdictStyle> = {
-	PASS: { icon: "✅", label: "真身", color: "success" },
-	LIKELY: { icon: "🟢", label: "大概率真身", color: "success" },
-	FAMILY_MATCH: { icon: "🟡", label: "同家族换壳/降级", color: "warning" },
-	SUSPECT: { icon: "🟠", label: "混池嫌疑", color: "warning" },
-	FAIL: { icon: "❌", label: "假冒", color: "error" },
-	INCONCLUSIVE: { icon: "⚪", label: "无法判定", color: "dim" },
-	LIMITED: { icon: "⚪", label: "指纹库未覆盖", color: "dim" },
+type Color = "success" | "warning" | "error" | "dim" | "text" | "accent";
+const VERDICTS: Record<string, { icon: string; zh: string; color: Color }> = {
+	CLEAN: { icon: "✅", zh: "未发现掺水", color: "success" },
+	SUSPECT: { icon: "🟠", zh: "发现可疑回答", color: "warning" },
+	MISMATCH: { icon: "❌", zh: "不是声称的模型", color: "error" },
+	INCONCLUSIVE: { icon: "⚪", zh: "无法判定", color: "dim" },
+	UNVERIFIED: { icon: "⚪", zh: "无法核实（库外模型）", color: "dim" },
 };
-
-function verdictStyle(v: string | undefined): VerdictStyle {
-	return VERDICT_ZH[v ?? ""] ?? { icon: "⚪", label: v ?? "未知", color: "dim" };
-}
+const verdictOf = (v: string | undefined) => VERDICTS[v ?? ""] ?? { icon: "⚪", zh: v ?? "未知", color: "dim" as Color };
 
 type RunState = "running" | "done" | "error" | "aborted";
 
@@ -66,34 +58,61 @@ interface RunTarget {
 	base: string; // normalized: no trailing slash, no trailing /vN
 	modelId: string;
 	provider: string;
-	rounds: number;
+	samples: number;
+	depthName: string;
 	format: string;
 	apiKey: string;
+	bankId: string | null;
+}
+
+interface Assessment {
+	valid: boolean;
+	like?: string;
+	like_p?: number;
+	p_label?: number;
+	flagged?: boolean;
+	drifted?: boolean;
+}
+interface AnswerEvent {
+	index: number;
+	done: number;
+	total: number;
+	ok: boolean;
+	status: string | number;
+	parsed_numbers: number;
+	latency_ms: number | null;
+	assessment: Assessment;
+}
+interface LaneResult {
+	verdict: string;
+	headline: string;
+	why: string[];
+	n: number;
+	total: number;
+	k?: number;
+	k_star?: number;
+	j?: number;
+	j_star?: number;
+	detectable_share?: number | null;
+}
+interface LaneInfo {
+	transport?: { format: string; thinking: string; injection_estimate: number | null; probe_input_tokens: number | null };
+	fatal?: boolean;
+	error?: string | null;
 }
 
 interface BankModel {
 	id: string;
 	display_name?: string;
-	family?: string;
 }
-interface Bank {
-	models: BankModel[];
-}
-
-let bankPromise: Promise<Bank> | undefined;
-/** Load the fingerprint bank via the repo's own loader (24h cache, auto-download). */
-function getBank(): Promise<Bank> {
-	bankPromise ??= import(pathToFileURL(path.join(REPO_ROOT, "lib", "bank.mjs")).href).then((m) => m.loadBank({}));
-	return bankPromise;
-}
-
-/** Exact id/display_name match, then a normalized form (case + trailing date stamp). */
-function findCoveredModel(bank: Bank, label: string): BankModel | undefined {
-	const norm = (s: string) => s.toLowerCase().replace(/-\d{8}$/, "");
-	const target = norm(label);
-	return bank.models.find(
-		(m) => m.id === label || m.display_name === label || norm(m.id) === target || norm(String(m.display_name ?? "")) === target,
-	);
+let libPromise: Promise<{ bank: { models: BankModel[] }; resolveLabel: (b: unknown, l: string) => BankModel | null }> | undefined;
+/** Load the bank through the repo's own loader so name matching matches the CLI exactly. */
+function getLib() {
+	libPromise ??= import(pathToFileURL(path.join(REPO_ROOT, "lib", "bank.mjs")).href).then(async (m) => ({
+		bank: await m.loadBank({}),
+		resolveLabel: m.resolveLabel,
+	}));
+	return libPromise;
 }
 
 /** Strip ANSI escape sequences from child-process output before re-rendering. */
@@ -102,22 +121,24 @@ function stripAnsi(s: string): string {
 	return s.replace(/\x1b\[[0-9;?]*[a-zA-Z]|\x1b\(B/g, "");
 }
 
-interface Lane {
-	label: string;
-	family?: string;
-	verdict?: { verdict: string; reason: string };
-	pooled?: { used: number; prediction: string; family: string; p: number; top4?: Array<{ m: string; family: string; p: number; sim: number }> } | null;
-	probe?: { input_tokens?: number; injection_estimate?: number; self_report?: string } | null;
-	harness?: { self_report?: string } | null;
-	stats?: { requests: number; ok: number; empty: number; errors: number; p50_ms?: number; p95_ms?: number };
-	ctx?: { format: string; thinkingMode: string };
+const pct = (x: number | undefined | null) => (x == null ? "-" : `${Math.round(x * 100)}%`);
+
+export function parseDepth(args: string | undefined): { samples: number; depthName: string } {
+	const a = (args ?? "").trim().toLowerCase();
+	if (DEPTHS[a]) return { samples: DEPTHS[a], depthName: a === "deep" ? "深度" : "快速" };
+	const n = Number.parseInt(a, 10);
+	if (Number.isFinite(n) && n >= 3) return { samples: Math.min(n, 41), depthName: "自定义" };
+	return { samples: DEPTHS.quick, depthName: "快速" };
 }
 
 export default function (pi: ExtensionAPI) {
 	pi.registerCommand("fireye", {
-		description: "Fireye fingerprint test on the current model (default 1 round; /fireye 3 for 3 rounds)",
+		description: "Fireye: is the current model genuine or diluted? (/fireye = quick 9 answers, /fireye deep = 30)",
 		getArgumentCompletions: (prefix: string) => {
-			const items = ["1", "3", "5"].map((v) => ({ value: v, label: `${v} round${v === "1" ? "" : "s"}` }));
+			const items = [
+				{ value: "quick", label: "quick — 9 条回答，几分钟" },
+				{ value: "deep", label: "deep — 30 条回答，能抓更低比例的掺水" },
+			];
 			const filtered = items.filter((i) => i.value.startsWith(prefix));
 			return filtered.length > 0 ? filtered : null;
 		},
@@ -126,40 +147,27 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify("fireye: interactive TUI mode only", "error");
 				return;
 			}
-
 			const model = ctx.model;
 			if (!model) {
 				ctx.ui.notify("fireye: no model selected", "error");
 				return;
 			}
-
 			const format = API_TO_FORMAT[model.api as string];
 			if (!format) {
-				ctx.ui.notify(
-					`fireye: ${model.provider}/${model.id} 的 API 类型 "${model.api}" 暂不支持。可测: anthropic-messages / openai-completions / openai-responses`,
-					"error",
-				);
+				ctx.ui.notify(`fireye: ${model.provider}/${model.id} 的 API 类型 "${model.api}" 暂不支持。可测: anthropic-messages / openai-completions / openai-responses`, "error");
 				return;
 			}
-
 			if (!fs.existsSync(BIN)) {
 				ctx.ui.notify(`fireye: bin/fireye.mjs not found under ${REPO_ROOT}`, "error");
 				return;
 			}
 
-			const parsed = Number.parseInt((args ?? "").trim(), 10);
-			const rounds = Number.isFinite(parsed) && parsed > 0 ? Math.min(parsed, 20) : 1;
-
-			let bank: Bank;
+			let bankId: string | null = null;
 			try {
-				bank = await getBank();
+				const lib = await getLib();
+				bankId = lib.resolveLabel(lib.bank, model.id)?.id ?? null;
 			} catch (e) {
 				ctx.ui.notify(`fireye: 指纹库加载失败: ${e instanceof Error ? e.message : String(e)}`, "error");
-				return;
-			}
-			if (!findCoveredModel(bank, model.id)) {
-				const ids = bank.models.map((m) => m.id).join(", ");
-				ctx.ui.notify(`fireye: 指纹库未覆盖 "${model.id}"，测了也只能给 LIMITED。支持的模型名: ${ids}`, "warning");
 				return;
 			}
 
@@ -177,26 +185,16 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify(`fireye: no base URL for provider ${model.provider}`, "error");
 				return;
 			}
-
 			// fireye appends /v1/messages, /v1/chat/completions, /v1/responses itself.
 			const base = rawBase.replace(/\/+$/, "").replace(/\/v\d+$/i, "");
 
-			const target: RunTarget = {
-				base,
-				modelId: model.id,
-				provider: model.provider,
-				rounds,
-				format,
-				apiKey: auth.apiKey,
-			};
-
+			const target: RunTarget = { base, modelId: model.id, provider: model.provider, format, apiKey: auth.apiKey, bankId, ...parseDepth(args) };
 			const summary = await ctx.ui.custom<string | undefined>(
 				(tui, theme, _keybindings, done) => new FireyeOverlay(tui, theme, done, target),
 				{ overlay: true, overlayOptions: { width: "90%", maxHeight: "85%", anchor: "center" } },
 			);
-
 			if (summary) {
-				const level = summary.includes("❌") ? "error" : /🟡|🟠|⚪/.test(summary) ? "warning" : "info";
+				const level = summary.includes("❌") ? "error" : /🟠|⚪/.test(summary) ? "warning" : "info";
 				ctx.ui.notify(summary, level);
 			}
 		},
@@ -212,24 +210,23 @@ export class FireyeOverlay implements Focusable {
 	private target: RunTarget;
 
 	private state: RunState = "running";
-	private logLines: string[] = [];
-	private reportPath: string | undefined;
+	private answers: AnswerEvent[] = [];
+	private lane: LaneInfo = {};
+	private result: LaneResult | undefined;
+	private plainLog: string[] = [];
+	private reportDir: string | undefined;
 	private reportLines: string[] | undefined;
-	private lane: Lane | undefined;
 	private view: "summary" | "report" = "summary";
 	private errorMsg: string | undefined;
 	private finishedAt: number | undefined;
 	private scroll = 0;
+	/** Wrapped line count of the last render, for scroll bounds. */
+	private lineCount = 0;
 	private startedAt = Date.now();
 	private child: ChildProcess | undefined;
 	private timer: ReturnType<typeof setInterval> | undefined;
 
-	constructor(
-		tui: { requestRender: () => void },
-		theme: Theme,
-		done: (value: string | undefined) => void,
-		target: RunTarget,
-	) {
+	constructor(tui: { requestRender: () => void }, theme: Theme, done: (value: string | undefined) => void, target: RunTarget) {
 		this.tui = tui;
 		this.theme = theme;
 		this.done = done;
@@ -238,12 +235,30 @@ export class FireyeOverlay implements Focusable {
 		this.start();
 	}
 
+	private onEvent(ev: Record<string, unknown>): void {
+		switch (ev.type) {
+			case "lane":
+				this.lane = ev as LaneInfo;
+				break;
+			case "answer":
+				this.answers.push(ev as unknown as AnswerEvent);
+				break;
+			case "lane_done":
+				this.result = ev.result as LaneResult;
+				break;
+			case "report":
+				this.reportDir = String(ev.dir);
+				break;
+		}
+	}
+
 	private start(): void {
-		const { base, modelId, rounds, format, apiKey } = this.target;
+		const { base, modelId, samples, format, apiKey } = this.target;
+		const concurrency = Math.min(samples, MAX_CONCURRENCY);
 		// Key travels via env so it never appears in the process argument list.
 		const child = spawn(
 			"node",
-			[BIN, "--base", base, "--models", modelId, "--rounds", String(rounds), "--concurrency", "1", "--format", format, "--out", REPORTS_DIR],
+			[BIN, "--base", base, "--models", modelId, "--samples", String(samples), "--concurrency", String(concurrency), "--format", format, "--out", REPORTS_DIR, "--events", "--yes"],
 			{ cwd: REPO_ROOT, env: { ...process.env, FIREYE_KEY: apiKey } },
 		);
 		this.child = child;
@@ -256,22 +271,29 @@ export class FireyeOverlay implements Focusable {
 			for (const raw of parts) {
 				const line = stripAnsi(raw).replace(/\s+$/, "");
 				if (!line) continue;
-				this.logLines.push(line);
-				if (this.logLines.length > MAX_LOG_LINES) this.logLines.shift();
-				const rm = line.match(REPORT_RE);
-				if (rm) this.reportPath = rm[1];
+				if (line.startsWith(EVENT_PREFIX)) {
+					try {
+						this.onEvent(JSON.parse(line.slice(EVENT_PREFIX.length)));
+					} catch {
+						// ignore a malformed event line
+					}
+				} else {
+					this.plainLog.push(line);
+					if (this.plainLog.length > 200) this.plainLog.shift();
+				}
 			}
 			this.tui.requestRender();
 		};
 		child.stdout?.on("data", onData);
 		child.stderr?.on("data", onData);
 
+		const budget = Math.ceil(samples / concurrency) * ANSWER_BUDGET_MS + 2 * 60 * 1000;
 		const watchdog = setTimeout(() => {
 			if (this.state === "running") {
-				this.errorMsg = "overall timeout (10 min)";
+				this.errorMsg = `超时（${Math.round(budget / 60000)} 分钟）`;
 				child.kill("SIGINT");
 			}
-		}, OVERALL_TIMEOUT_MS);
+		}, budget);
 
 		child.on("error", (err) => {
 			clearTimeout(watchdog);
@@ -280,7 +302,6 @@ export class FireyeOverlay implements Focusable {
 			this.stopClock();
 			this.tui.requestRender();
 		});
-
 		child.on("close", (code) => {
 			clearTimeout(watchdog);
 			this.child = undefined;
@@ -292,19 +313,8 @@ export class FireyeOverlay implements Focusable {
 					this.errorMsg ??= `exit code ${code}`;
 				}
 			}
-			if (this.reportPath && fs.existsSync(this.reportPath)) {
-				this.reportLines = fs.readFileSync(this.reportPath, "utf8").split("\n");
-				const rawPath = this.reportPath.replace(/report\.md$/, "raw.json");
-				if (fs.existsSync(rawPath)) {
-					try {
-						const raw = JSON.parse(fs.readFileSync(rawPath, "utf8"));
-						this.lane = raw.lanes?.[0];
-					} catch {
-						// fall back to the raw report view
-					}
-				}
-			}
-			if (!this.lane) this.view = "report";
+			const md = this.reportDir && path.join(this.reportDir, "report.md");
+			if (md && fs.existsSync(md)) this.reportLines = fs.readFileSync(md, "utf8").split("\n");
 			this.tui.requestRender();
 		});
 	}
@@ -321,31 +331,19 @@ export class FireyeOverlay implements Focusable {
 			this.finish();
 			return;
 		}
-
-		if ((matchesKey(data, "tab") || data === "r") && this.state !== "running") {
-			if (this.lane || this.reportLines) {
-				this.view = this.view === "summary" ? "report" : "summary";
-				if (!this.lane) this.view = "report";
-				this.scroll = 0;
-				this.tui.requestRender();
-			}
+		if ((matchesKey(data, "tab") || data === "r") && this.state !== "running" && this.reportLines) {
+			this.view = this.view === "summary" ? "report" : "summary";
+			this.scroll = 0;
+			this.tui.requestRender();
 			return;
 		}
-
-		const content = this.contentLines();
 		const viewH = this.contentViewH();
-		const maxScroll = Math.max(0, content.length - viewH);
-		if (matchesKey(data, "up") || data === "k") {
-			this.scroll = Math.max(0, this.scroll - 1);
-		} else if (matchesKey(data, "down") || data === "j") {
-			this.scroll = Math.min(maxScroll, this.scroll + 1);
-		} else if (matchesKey(data, "pageUp")) {
-			this.scroll = Math.max(0, this.scroll - viewH);
-		} else if (matchesKey(data, "pageDown")) {
-			this.scroll = Math.min(maxScroll, this.scroll + viewH);
-		} else {
-			return;
-		}
+		const maxScroll = Math.max(0, this.lineCount - viewH);
+		if (matchesKey(data, "up") || data === "k") this.scroll = Math.max(0, this.scroll - 1);
+		else if (matchesKey(data, "down") || data === "j") this.scroll = Math.min(maxScroll, this.scroll + 1);
+		else if (matchesKey(data, "pageUp")) this.scroll = Math.max(0, this.scroll - viewH);
+		else if (matchesKey(data, "pageDown")) this.scroll = Math.min(maxScroll, this.scroll + viewH);
+		else return;
 		this.tui.requestRender();
 	}
 
@@ -359,69 +357,79 @@ export class FireyeOverlay implements Focusable {
 
 	private finish(): void {
 		this.stopClock();
-		const lane = this.lane;
-		const pathNote = this.reportPath ? ` — ${this.reportPath}` : "";
-		if (lane?.verdict) {
-			const s = verdictStyle(lane.verdict.verdict);
-			const p = lane.pooled?.p != null ? ` p=${lane.pooled.p}` : "";
-			this.done(`fireye ${s.icon} ${s.label} — ${lane.label}${p}${pathNote}`);
-			return;
-		}
-		if (this.state === "done") this.done(`fireye 完成${pathNote}`);
-		else if (this.state === "aborted") this.done(`fireye 已取消${pathNote}`);
+		const note = this.reportDir ? ` — ${this.reportDir}/report.md` : "";
+		if (this.result) {
+			const v = verdictOf(this.result.verdict);
+			this.done(`fireye ${v.icon} ${this.result.headline} — ${this.target.modelId}：${this.result.why[0] ?? ""}${note}`);
+		} else if (this.state === "aborted") this.done(`fireye 已取消${note}`);
+		else if (this.state === "error") this.done(`fireye 出错：${this.errorMsg ?? ""}`);
 		else this.done(undefined);
 	}
 
-	/** Plain-language verdict lines for the default view. */
-	private summaryLines(): Array<{ c: string; t: string }> {
-		const lane = this.lane;
-		if (!lane?.verdict) return [{ c: "dim", t: "（无结构化结果，按 Tab 看完整报告）" }];
-		const s = verdictStyle(lane.verdict.verdict);
-		const top = lane.pooled?.top4?.[0];
-		const out: Array<{ c: string; t: string }> = [];
+	/** One line per answer, in arrival order. */
+	private answerLine(a: AnswerEvent): { c: Color; t: string } {
+		const n = `#${String(a.index + 1).padStart(2)}`;
+		if (!a.ok) return { c: "dim", t: `${n}  没有回答（${a.status}，已重试）` };
+		const s = a.assessment;
+		if (!s.valid) return { c: "dim", t: `${n}  数字太少（${a.parsed_numbers} 个），不计入` };
+		const secs = a.latency_ms != null ? `  ${Math.round(a.latency_ms / 1000)}s` : "";
+		if (!this.target.bankId) return { c: "text", t: `${n}  像 ${s.like}（${pct(s.like_p)}）${secs}` };
+		if (s.flagged) return { c: "error", t: `${n}  ✗ 明显不像标签，像 ${s.like}（${pct(s.like_p)}）${secs}` };
+		if (s.like !== this.target.bankId) return { c: "warning", t: `${n}  ≈ 更像 ${s.like}（标签 ${pct(s.p_label)}，单条不能排除）${secs}` };
+		return { c: "success", t: `${n}  ✓ 像标签${secs}` };
+	}
 
-		let headline = `${s.icon}  ${s.label}`;
-		if (lane.verdict.verdict === "FAIL" && top) headline += ` — 行为像 ${top.m}（${top.family} 家族）`;
-		if (lane.verdict.verdict === "FAMILY_MATCH" && top) headline += ` — 更像 ${top.m}`;
-		if (lane.verdict.verdict === "SUSPECT") headline += " — 各轮归因不一致";
-		if (lane.verdict.verdict === "INCONCLUSIVE" && lane.verdict.reason.startsWith("transport fatal")) headline += " — 请求被拒或连接失败";
-		out.push({ c: s.color, t: headline });
+	private runningLines(): Array<{ c: Color; t: string }> {
+		const t = this.target;
+		const out: Array<{ c: Color; t: string }> = [];
+		if (this.lane.fatal) out.push({ c: "error", t: `连接失败：${this.lane.error ?? ""}` });
+		const got = this.answers.length;
+		const valid = this.answers.filter((a) => a.assessment.valid);
+		const off = valid.filter((a) => a.assessment.flagged).length;
+		const drift = valid.filter((a) => a.assessment.like !== t.bankId).length - off;
+		const bar = "█".repeat(Math.round((got / t.samples) * 20)).padEnd(20, "░");
+		out.push({ c: "text", t: `进度  ${bar}  已收到 ${got}/${t.samples} 条回答（并行发出）` });
+		if (t.bankId) out.push({ c: off || drift ? "warning" : "text", t: `目前  ${valid.length - off - drift} 条像 ${t.modelId}${drift ? `，${drift} 条更像别的模型` : ""}${off ? `，${off} 条明显不像` : ""}` });
+		else out.push({ c: "warning", t: `注意  指纹库没有 ${t.modelId}，只能告诉你它像谁，不能下结论` });
 		out.push({ c: "dim", t: "" });
-
-		if (lane.pooled?.prediction) {
-			out.push({ c: "text", t: `归因 top1  ${lane.pooled.prediction}（${lane.pooled.family} 家族）` });
-			out.push({ c: "text", t: `置信度    p=${lane.pooled.p} · 分布相似度 sim=${top?.sim ?? "-"} · 有效样本 ${lane.pooled.used}` });
-		} else {
-			out.push({ c: "text", t: `有效样本不足，无法归因（${lane.verdict.reason}）` });
-		}
-
-		const inj = lane.probe?.injection_estimate;
-		if (inj != null) out.push({ c: "text", t: `注入估算  ${inj} tok（"hi" 实际 input ${lane.probe?.input_tokens ?? "?"} tok）` });
-
-		const st = lane.stats;
-		if (st) {
-			const p50 = st.p50_ms != null ? ` · p50 ${(st.p50_ms / 1000).toFixed(1)}s` : "";
-			out.push({ c: "text", t: `可靠性    ${st.ok}/${st.requests} 成功 · ${st.empty} 空响应 · ${st.errors} 错误${p50}` });
-		}
-		const self = (lane.harness?.self_report || lane.probe?.self_report || "").replace(/\n+/g, " ").slice(0, 60);
-		if (self) out.push({ c: "dim", t: `自报身份  "${self}"（注入词台词，仅线索）` });
-		if (lane.ctx) out.push({ c: "dim", t: `协议      ${lane.ctx.format}/${lane.ctx.thinkingMode}` });
-		out.push({ c: "dim", t: `依据      ${lane.verdict.reason}` });
-		if (this.reportPath) out.push({ c: "dim", t: `报告      ${this.reportPath}` });
+		for (const a of this.answers) out.push(this.answerLine(a));
+		if (!got) out.push({ c: "dim", t: this.lane.transport ? "等待第一条回答…（每条通常 30–120 秒）" : "连接站点、确认协议…" });
 		return out;
 	}
 
-	private contentLines(): string[] {
-		if (this.state === "running") return this.logLines;
-		if (this.view === "report" || !this.lane) return this.reportLines ?? this.logLines;
-		return this.summaryLines().map((l) => l.t);
+	/** Plain-language result page. */
+	private summaryLines(): Array<{ c: Color; t: string }> {
+		const r = this.result;
+		if (!r) {
+			const tail = this.plainLog.slice(-8).map((t) => ({ c: "dim" as Color, t }));
+			return [{ c: "error", t: this.state === "aborted" ? "已取消" : `没有结果${this.errorMsg ? `：${this.errorMsg}` : ""}` }, ...tail];
+		}
+		const v = verdictOf(r.verdict);
+		const out: Array<{ c: Color; t: string }> = [];
+		out.push({ c: v.color, t: `${v.icon}  ${r.headline}` });
+		out.push({ c: "dim", t: "" });
+		for (const w of r.why) out.push({ c: "text", t: `·  ${w}` });
+		if (this.target.bankId && this.target.bankId !== this.target.modelId) out.push({ c: "dim", t: `·  按指纹库中的 ${this.target.bankId} 核对` });
+		if (this.answers.length) {
+			out.push({ c: "dim", t: "" });
+			out.push({ c: "accent", t: "逐条" });
+			for (const a of [...this.answers].sort((x, y) => x.index - y.index)) out.push(this.answerLine(a));
+		}
+		const tr = this.lane.transport;
+		if (tr) {
+			out.push({ c: "dim", t: "" });
+			const inj = tr.injection_estimate;
+			const injText = inj == null ? "未知" : inj < 50 ? `约 ${inj} token（基本是直连）` : `约 ${inj} token（站点在你的请求前加了提示词，按输入计费）`;
+			out.push({ c: "dim", t: `隐藏提示词  ${injText}` });
+		}
+		if (this.reportDir) out.push({ c: "dim", t: `报告        ${this.reportDir}/report.md` });
+		return out;
 	}
 
 	private contentViewH(): number {
 		const rows = process.stdout.rows || 24;
-		// The overlay container hard-clips render output to maxHeight (85% of
-		// terminal rows). Keep total emitted lines under the cap: content +
-		// 6 chrome lines (borders, title, status, blank, hint) + 2 spare.
+		// The overlay container hard-clips render output to maxHeight (85% of terminal rows):
+		// content + 6 chrome lines (borders, title, status, blank, hint) + 2 spare.
 		return Math.max(5, Math.floor(0.85 * rows) - 8);
 	}
 
@@ -429,7 +437,6 @@ export class FireyeOverlay implements Focusable {
 		const th = this.theme;
 		const w = Math.max(40, width);
 		const innerW = w - 2;
-
 		const truncate = (s: string, max: number): string => {
 			let out = "";
 			let used = 0;
@@ -449,49 +456,64 @@ export class FireyeOverlay implements Focusable {
 
 		const lines: string[] = [];
 		lines.push(th.fg("border", `╭${"─".repeat(innerW)}╮`));
-
 		const t = this.target;
-		const title = ` 🔥 fireye · ${th.fg("accent", `${t.provider}/${t.modelId}`)} · rounds=${t.rounds} · ${th.fg("dim", t.base)}`;
-		lines.push(row(title));
+		lines.push(row(` 🔥 fireye · ${th.fg("accent", `${t.provider}/${t.modelId}`)} · ${t.depthName} ${t.samples} 条 · ${th.fg("dim", t.base)}`));
 
 		const elapsed = Math.floor(((this.finishedAt ?? Date.now()) - this.startedAt) / 1000);
+		const clock = `${Math.floor(elapsed / 60)}:${String(elapsed % 60).padStart(2, "0")}`;
 		let status: string;
-		if (this.state === "running") {
-			const doneCount = this.logLines.filter((l) => /r\d+\.\d+ ✓/.test(l)).length;
-			status = ` ${th.fg("warning", "● 测试中")} ${elapsed}s · 响应 ${doneCount}/${t.rounds * 3} · Esc 取消`;
-		}
+		if (this.state === "running") status = ` ${th.fg("warning", "● 测试中")} ${clock} · Esc 取消`;
 		else if (this.state === "done") {
-			const s = this.lane?.verdict ? verdictStyle(this.lane.verdict.verdict) : undefined;
-			status = ` ${th.fg("success", "● 完成")} ${elapsed}s${s ? ` · ${s.icon} ${th.fg(s.color, s.label)}` : ""}`;
-		} else if (this.state === "aborted") status = ` ${th.fg("warning", "● 已取消")}`;
+			const v = this.result ? verdictOf(this.result.verdict) : undefined;
+			const r = this.result;
+			// Always show the drift count next to a clean verdict, so "未发现掺水" never hides it.
+			const counts = r && r.j != null && r.n ? th.fg(r.j ? "warning" : "dim", ` · ${r.j}/${r.n} 条更像别的模型（可疑线 ${r.j_star}）`) : "";
+			status = ` ${th.fg("success", "● 完成")} ${clock}${v ? ` · ${v.icon} ${th.fg(v.color as never, r!.headline)}${counts}` : ""}`;
+		} else if (this.state === "aborted") status = ` ${th.fg("warning", "● 已取消")} ${clock}`;
 		else status = ` ${th.fg("error", "● 出错")} ${this.errorMsg ?? ""}`;
 		lines.push(row(status));
 		lines.push(row(""));
 
 		const viewH = this.contentViewH();
-		if (this.state === "running") {
-			const slice = this.logLines.slice(-Math.max(1, viewH));
-			for (const l of slice) lines.push(row(` ${th.fg("dim", l)}`));
-		} else if (this.view === "summary" && this.lane) {
-			for (const l of this.summaryLines()) {
-				lines.push(row(` ${th.fg(l.c as never, l.t)}`));
+		const styled =
+			this.state === "running"
+				? this.runningLines()
+				: this.view === "report" && this.reportLines
+					? this.reportLines.map((t2) => ({ c: "dim" as Color, t: t2 }))
+					: this.summaryLines();
+		// Wrap long lines (CJK-aware widths) instead of clipping them.
+		const wrapped: Array<{ c: Color; t: string }> = [];
+		const maxW = innerW - 2;
+		for (const l of styled) {
+			let cur = "";
+			let used = 0;
+			for (const ch of l.t) {
+				const cw = visibleWidth(ch);
+				if (used + cw > maxW) {
+					wrapped.push({ c: l.c, t: cur });
+					cur = "   ";
+					used = 3;
+				}
+				cur += ch;
+				used += cw;
 			}
-		} else {
-			const content = this.reportLines ?? this.logLines;
-			const maxScroll = Math.max(0, content.length - viewH);
-			this.scroll = Math.min(this.scroll, maxScroll);
-			for (const l of content.slice(this.scroll, this.scroll + viewH)) lines.push(row(` ${th.fg("dim", l)}`));
+			wrapped.push({ c: l.c, t: cur });
 		}
+		this.lineCount = wrapped.length;
+		// While running, keep the newest answers visible; otherwise honour the scroll offset.
+		const maxScroll = Math.max(0, wrapped.length - viewH);
+		const start = this.state === "running" ? maxScroll : Math.min(this.scroll, maxScroll);
+		this.scroll = start;
+		for (const l of wrapped.slice(start, start + viewH)) lines.push(row(` ${th.fg(l.c as never, l.t)}`));
 
 		const hint =
 			this.state === "running"
-				? ` ${this.logLines.length} log lines · Esc 取消测试`
-				: this.lane || this.reportLines
-					? ` Tab 切换${this.view === "summary" ? "完整报告" : "摘要"} · ↑↓ 滚动 · Esc/q 关闭`
-					: " Esc/q 关闭";
+				? " Esc 取消测试"
+				: this.reportLines
+					? ` Tab 切换${this.view === "summary" ? "完整报告" : "结果"} · ↑↓ 滚动 · Esc/q 关闭`
+					: " ↑↓ 滚动 · Esc/q 关闭";
 		lines.push(row(th.fg("dim", hint)));
 		lines.push(th.fg("border", `╰${"─".repeat(innerW)}╯`));
-
 		return lines;
 	}
 

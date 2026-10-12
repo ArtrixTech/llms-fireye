@@ -1,0 +1,4 @@
+[submodule "vendor/modeltrace"]
+	path = vendor/modeltrace
+	url = https://github.com/ArtrixTech/ModelTrace.git
+	branch = fireye
