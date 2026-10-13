@@ -5,7 +5,7 @@
 
 import { loadBank, bankSummary, resolveLabel } from '../lib/bank.mjs';
 import { detectTransport, MASK } from '../lib/transport.mjs';
-import { runLane, makeSemaphore, DEPTHS } from '../lib/runner.mjs';
+import { runLane, makeSemaphore, DEPTHS, AUTO_LOOKS } from '../lib/runner.mjs';
 import { VERDICTS, loadCalibration } from '../lib/attribution.mjs';
 import { writeReport } from '../lib/report.mjs';
 
@@ -19,8 +19,11 @@ function arg(name, def) {
 const base = arg('base') || process.env.FIREYE_BASE;
 const key = arg('key') || process.env.FIREYE_KEY;
 const models = String(arg('models', '')).split(',').map(s => s.trim()).filter(Boolean);
-const depth = String(arg('depth', 'quick'));
-const samples = Number(arg('samples', DEPTHS[depth] ?? NaN));
+// --samples N fixes the size; otherwise --depth auto (default) | quick | deep.
+const depth = arg('samples') ? 'fixed' : String(arg('depth', 'auto'));
+const auto = depth === 'auto';
+const samples = auto ? AUTO_LOOKS.at(-1) : Number(arg('samples', DEPTHS[depth] ?? NaN));
+const tokenProbes = !arg('no-token-check');
 const concurrency = Number(arg('concurrency', 8));
 const effort = String(arg('effort', 'medium'));
 const outDir = String(arg('out', 'reports'));
@@ -33,12 +36,13 @@ const format = String(arg('format', 'auto'));
 const events = !!arg('events');
 
 const usage = `Usage: node bin/fireye.mjs --base https://relay.example --key sk-... --models claude-opus-5-5,glm-5.3 \\
-  [--depth quick|deep] [--samples N] [--concurrency 8] [--format auto|anthropic|openai|openai-responses] \\
+  [--depth auto|quick|deep] [--samples N] [--no-token-check] [--concurrency 8] [--format auto|anthropic|openai|openai-responses] \\
   [--effort medium] [--timeout-ms 300000] [--max-requests 300] [--out reports] [--bank path] [--events] [--yes]
-  depth: quick=${DEPTHS.quick} answers per model, deep=${DEPTHS.deep}`;
+  depth: auto=${AUTO_LOOKS.join('→')} answers (stops early when clear, default), quick=${DEPTHS.quick}, deep=${DEPTHS.deep}
+  --samples N: fixed N answers (3-41). --no-token-check: skip the echo probes (one short request per answer)`;
 
 if (!['auto', 'anthropic', 'openai', 'openai-responses'].includes(format)) { console.error(`invalid --format ${format}\n${usage}`); process.exit(1); }
-if (!base || !key || !models.length || !(samples >= 3 && samples <= 41)) { console.error(usage); process.exit(1); }
+if (!base || !key || !models.length || !(auto || DEPTHS[depth] || depth === 'fixed') || !(samples >= 3 && samples <= 41)) { console.error(usage); process.exit(1); }
 
 const emit = (ev) => { if (events) console.log(`@@fireye ${JSON.stringify(ev)}`); };
 const say = (s) => { if (!events) console.log(s); };
@@ -48,11 +52,11 @@ const cal = loadCalibration();
 if (cal.placeholder) console.error('warning: lib/calibration.json missing — using conservative placeholder thresholds (run scripts/calibrate.mjs)');
 else if (JSON.stringify(cal.bank_models) !== JSON.stringify(bank.models.map(m => m.id).sort())) console.error('warning: lib/calibration.json was made for a different bank model list — re-run scripts/calibrate.mjs');
 
-const estimate = models.length * (samples + 1);
+const estimate = models.length * (samples * (tokenProbes ? 2 : 1) + 1);
 if (estimate > maxRequests && !yes) { console.error(`estimated ${estimate} requests > --max-requests ${maxRequests}; add --yes`); process.exit(1); }
 
-say(`fireye: ${base} key=${MASK(key)} · ${models.join(', ')} · ${samples} answers each · concurrency ${concurrency}`);
-emit({ type: 'start', base, models, samples, concurrency, bank_models: bank.models.length });
+say(`fireye: ${base} key=${MASK(key)} · ${models.join(', ')} · ${auto ? `auto ${AUTO_LOOKS.join('→')}` : samples} answers each${tokenProbes ? ' + echo probes' : ''} · concurrency ${concurrency}`);
+emit({ type: 'start', base, models, samples, auto, looks: auto ? AUTO_LOOKS : [samples], token_probes: tokenProbes, concurrency, bank_models: bank.models.length });
 
 const semaphore = makeSemaphore(concurrency);
 
@@ -76,9 +80,11 @@ const lanes = await Promise.all(models.map(async (label) => {
   if (!labelModel) log('label not in fingerprint bank: will report what it behaves like, not a verdict');
   const ctx = { base, key, format: det.format, model: label, effort, thinkingMode: det.thinkingMode, timeoutMs, bank, maxTokens: 16384 };
   const lane = await runLane({
-    label, labelModel, ctx, samples, semaphore,
+    label, labelModel, ctx, samples, auto, tokenProbes, semaphore,
     onEvent: (ev) => {
       emit(ev);
+      if (ev.type === 'look') { log(`look ${ev.n} answers: ${ev.verdict} k=${ev.k} j=${ev.j}${ev.next ? ` → extend to ${ev.next} (${ev.reason})` : ' → stop'}`); return; }
+      if (ev.type === 'probe') { if (ev.count == null) log(`probe ${ev.index + 1}: unusable (${ev.why})`); return; }
       const a = ev.assessment;
       log(`${ev.done}/${ev.total} ${!ev.ok ? `no answer (${ev.status})` : !a.valid ? `too few numbers (${ev.parsed_numbers})` : `looks like ${a.like}${a.flagged ? '  ✗ off-label' : a.drifted ? '  ≈ drifted' : ''}`}`);
     },
@@ -88,7 +94,7 @@ const lanes = await Promise.all(models.map(async (label) => {
   return lane;
 }));
 
-const dir = writeReport({ outDir, base, key, bank: bankSummary(bank), calibration: cal, samples, concurrency, effort, lanes });
+const dir = writeReport({ outDir, base, key, bank: bankSummary(bank), calibration: cal, samples, auto, concurrency, effort, lanes });
 emit({ type: 'report', dir });
 say(`\nreport → ${dir}/report.md`);
 for (const lane of lanes) {

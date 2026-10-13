@@ -1,0 +1,131 @@
+{
+ "note": "Echo probe for the token-count check. Built by scripts/tokenizer-table.py; counts exclude special tokens.",
+ "prompt": "请原样输出下面这段文字，只输出这段文字本身，不要加引号、不要翻译、不要任何解释：\n\n他一边喝着热茶，一边翻看昨天的旧报纸。我们计划下个月去杭州西湖旅游，顺便看望外婆。航班 CA1831 于 08:45 起飞，预计 11:20 到达。",
+ "text": "他一边喝着热茶，一边翻看昨天的旧报纸。我们计划下个月去杭州西湖旅游，顺便看望外婆。航班 CA1831 于 08:45 起飞，预计 11:20 到达。",
+ "tolerance": 2,
+ "tokenizers": [
+  {
+   "tokenizers": [
+    "minimax-m3",
+    "minimax-m2.7"
+   ],
+   "families": [
+    "minimax"
+   ],
+   "sources": [
+    "MiniMaxAI/MiniMax-M3",
+    "MiniMaxAI/MiniMax-M2.7"
+   ],
+   "count": 42
+  },
+  {
+   "tokenizers": [
+    "kimi-k3",
+    "kimi-k2.6"
+   ],
+   "families": [
+    "kimi"
+   ],
+   "sources": [
+    "moonshotai/Kimi-K3",
+    "moonshotai/Kimi-K2.6"
+   ],
+   "count": 45
+  },
+  {
+   "tokenizers": [
+    "deepseek-v4-pro",
+    "deepseek-v4.1-flash"
+   ],
+   "families": [
+    "deepseek"
+   ],
+   "sources": [
+    "deepseek-ai/DeepSeek-V4-Pro",
+    "deepseek-ai/DeepSeek-V4.1-Flash"
+   ],
+   "count": 47
+  },
+  {
+   "tokenizers": [
+    "glm-5.3",
+    "glm-5.3-flash",
+    "glm-5.2"
+   ],
+   "families": [
+    "glm"
+   ],
+   "sources": [
+    "zai-org/GLM-5.3",
+    "zai-org/GLM-5.3-Flash",
+    "zai-org/GLM-5.2"
+   ],
+   "count": 50
+  },
+  {
+   "tokenizers": [
+    "qwen3.5"
+   ],
+   "families": [
+    "qwen"
+   ],
+   "sources": [
+    "Qwen/Qwen3.5-9B"
+   ],
+   "count": 52
+  },
+  {
+   "tokenizers": [
+    "gpt-oss",
+    "o200k"
+   ],
+   "families": [
+    "gpt",
+    "gpt-oss"
+   ],
+   "sources": [
+    "openai/gpt-oss-120b",
+    "tiktoken:o200k_base"
+   ],
+   "count": 55
+  },
+  {
+   "tokenizers": [
+    "gemma-4"
+   ],
+   "families": [
+    "gemma"
+   ],
+   "sources": [
+    "google/gemma-4-31B-it"
+   ],
+   "count": 59
+  },
+  {
+   "tokenizers": [
+    "mistral-large-3",
+    "nemotron-3"
+   ],
+   "families": [
+    "mistral",
+    "nemotron"
+   ],
+   "sources": [
+    "mistralai/Mistral-Large-3-675B-Instruct-2512",
+    "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16"
+   ],
+   "count": 76
+  },
+  {
+   "tokenizers": [
+    "cl100k"
+   ],
+   "families": [],
+   "sources": [
+    "tiktoken:cl100k_base"
+   ],
+   "count": 90
+  }
+ ],
+ "observed": {}
+}

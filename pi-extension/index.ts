@@ -1,14 +1,16 @@
 /**
- * llms-fireye pi extension — /fireye [quick|deep|N]
+ * llms-fireye pi extension — /fireye [auto|quick|deep|N]
  *
  * Tests whether the currently selected model (provider base URL + API key from pi's model
  * registry) is what it claims, or a diluted mix. Every answer is scored as it arrives and shown
  * live; the result page says in plain words what was found and how much dilution the sample
  * size could have caught.
  *
- *   /fireye        quick: 9 answers, all in parallel
+ *   /fireye        auto: 9 answers, extended to 18 and 30 only while the result is unclear
+ *   /fireye quick  9 answers, all in parallel
  *   /fireye deep   30 answers (catches lower dilution rates)
  *   /fireye 15     custom answer count (3–41)
+ * Every answer comes with a short echo probe (token-count check).
  *
  * Install:
  *   ln -s ~/GitHub/llms-fireye/pi-extension ~/.pi/agent/extensions/fireye
@@ -30,6 +32,7 @@ const REPO_ROOT = path.resolve(EXT_DIR, "..");
 const BIN = path.join(REPO_ROOT, "bin", "fireye.mjs");
 const REPORTS_DIR = process.env.FIREYE_PI_OUT ?? path.join(REPO_ROOT, "reports");
 const DEPTHS: Record<string, number> = { quick: 9, deep: 30 };
+const AUTO_LOOKS = [9, 18, 30];
 const MAX_CONCURRENCY = 10;
 /** One answer may take up to 5 min and is retried twice. */
 const ANSWER_BUDGET_MS = 3 * 5 * 60 * 1000;
@@ -60,6 +63,7 @@ interface RunTarget {
 	provider: string;
 	samples: number;
 	depthName: string;
+	auto: boolean;
 	format: string;
 	apiKey: string;
 	bankId: string | null;
@@ -83,6 +87,22 @@ interface AnswerEvent {
 	latency_ms: number | null;
 	assessment: Assessment;
 }
+interface ProbeEvent {
+	index: number;
+	count: number | null;
+	why?: string;
+}
+interface LookEvent {
+	n: number;
+	next: number | null;
+	reason: string | null;
+}
+interface TokenResult {
+	status: string;
+	m: number;
+	deviants?: number;
+	mode?: number;
+}
 interface LaneResult {
 	verdict: string;
 	headline: string;
@@ -94,6 +114,8 @@ interface LaneResult {
 	j?: number;
 	j_star?: number;
 	detectable_share?: number | null;
+	tokens?: TokenResult;
+	looks?: LookEvent[];
 }
 interface LaneInfo {
 	transport?: { format: string; thinking: string; injection_estimate: number | null; probe_input_tokens: number | null };
@@ -115,6 +137,25 @@ function getLib() {
 	return libPromise;
 }
 
+interface HistRow { label: string; count: number; expected: number | null }
+interface Hist { n: number; ref: { n: number; pooled: boolean } | null; rows: HistRow[] }
+interface Likeness {
+	stripText: (answers: unknown[]) => { bars: string; marks: string };
+	histogram: (answers: unknown[], cal: unknown, labelId: string) => Hist;
+	histogramLines: (h: Hist, width?: number) => string[];
+	shapeNote: (h: Hist) => string | null;
+	cal: unknown;
+}
+let likenessPromise: Promise<Likeness> | undefined;
+/** Same views as report.md (lib/likeness.mjs) with the genuine reference from calibration.json. */
+function getLikeness() {
+	likenessPromise ??= Promise.all([
+		import(pathToFileURL(path.join(REPO_ROOT, "lib", "likeness.mjs")).href),
+		import(pathToFileURL(path.join(REPO_ROOT, "lib", "attribution.mjs")).href),
+	]).then(([m, a]) => ({ ...(m as Omit<Likeness, "cal">), cal: a.loadCalibration() }));
+	return likenessPromise;
+}
+
 /** Strip ANSI escape sequences from child-process output before re-rendering. */
 function stripAnsi(s: string): string {
 	// eslint-disable-next-line no-control-regex
@@ -123,19 +164,20 @@ function stripAnsi(s: string): string {
 
 const pct = (x: number | undefined | null) => (x == null ? "-" : `${Math.round(x * 100)}%`);
 
-export function parseDepth(args: string | undefined): { samples: number; depthName: string } {
+export function parseDepth(args: string | undefined): { samples: number; depthName: string; auto: boolean } {
 	const a = (args ?? "").trim().toLowerCase();
-	if (DEPTHS[a]) return { samples: DEPTHS[a], depthName: a === "deep" ? "深度" : "快速" };
+	if (DEPTHS[a]) return { samples: DEPTHS[a], depthName: a === "deep" ? "深度" : "快速", auto: false };
 	const n = Number.parseInt(a, 10);
-	if (Number.isFinite(n) && n >= 3) return { samples: Math.min(n, 41), depthName: "自定义" };
-	return { samples: DEPTHS.quick, depthName: "快速" };
+	if (Number.isFinite(n) && n >= 3) return { samples: Math.min(n, 41), depthName: "自定义", auto: false };
+	return { samples: AUTO_LOOKS[AUTO_LOOKS.length - 1], depthName: "自动", auto: true };
 }
 
 export default function (pi: ExtensionAPI) {
 	pi.registerCommand("fireye", {
-		description: "Fireye: is the current model genuine or diluted? (/fireye = quick 9 answers, /fireye deep = 30)",
+		description: "Fireye: is the current model genuine or diluted? (/fireye = auto 9→30 answers, quick = 9, deep = 30)",
 		getArgumentCompletions: (prefix: string) => {
 			const items = [
+				{ value: "auto", label: "auto — 先测 9 条，结果不清楚才加测到 18 / 30（默认）" },
 				{ value: "quick", label: "quick — 9 条回答，几分钟" },
 				{ value: "deep", label: "deep — 30 条回答，能抓更低比例的掺水" },
 			];
@@ -211,6 +253,10 @@ export class FireyeOverlay implements Focusable {
 
 	private state: RunState = "running";
 	private answers: AnswerEvent[] = [];
+	private probes: ProbeEvent[] = [];
+	private looks: LookEvent[] = [];
+	/** Answers planned so far (auto mode grows this at each look). */
+	private planned: number;
 	private lane: LaneInfo = {};
 	private result: LaneResult | undefined;
 	private plainLog: string[] = [];
@@ -225,13 +271,16 @@ export class FireyeOverlay implements Focusable {
 	private startedAt = Date.now();
 	private child: ChildProcess | undefined;
 	private timer: ReturnType<typeof setInterval> | undefined;
+	private likeness: Likeness | undefined;
 
 	constructor(tui: { requestRender: () => void }, theme: Theme, done: (value: string | undefined) => void, target: RunTarget) {
 		this.tui = tui;
 		this.theme = theme;
 		this.done = done;
 		this.target = target;
+		this.planned = target.auto ? AUTO_LOOKS[0] : target.samples;
 		this.timer = setInterval(() => this.tui.requestRender(), 500);
+		getLikeness().then((l) => { this.likeness = l; this.tui.requestRender(); }, () => {});
 		this.start();
 	}
 
@@ -243,6 +292,15 @@ export class FireyeOverlay implements Focusable {
 			case "answer":
 				this.answers.push(ev as unknown as AnswerEvent);
 				break;
+			case "probe":
+				this.probes.push(ev as unknown as ProbeEvent);
+				break;
+			case "look": {
+				const l = ev as unknown as LookEvent;
+				this.looks.push(l);
+				if (l.next) this.planned = l.next;
+				break;
+			}
 			case "lane_done":
 				this.result = ev.result as LaneResult;
 				break;
@@ -253,12 +311,13 @@ export class FireyeOverlay implements Focusable {
 	}
 
 	private start(): void {
-		const { base, modelId, samples, format, apiKey } = this.target;
+		const { base, modelId, samples, format, apiKey, auto } = this.target;
 		const concurrency = Math.min(samples, MAX_CONCURRENCY);
+		const size = auto ? ["--depth", "auto"] : ["--samples", String(samples)];
 		// Key travels via env so it never appears in the process argument list.
 		const child = spawn(
 			"node",
-			[BIN, "--base", base, "--models", modelId, "--samples", String(samples), "--concurrency", String(concurrency), "--format", format, "--out", REPORTS_DIR, "--events", "--yes"],
+			[BIN, "--base", base, "--models", modelId, ...size, "--concurrency", String(concurrency), "--format", format, "--out", REPORTS_DIR, "--events", "--yes"],
 			{ cwd: REPO_ROOT, env: { ...process.env, FIREYE_KEY: apiKey } },
 		);
 		this.child = child;
@@ -287,7 +346,8 @@ export class FireyeOverlay implements Focusable {
 		child.stdout?.on("data", onData);
 		child.stderr?.on("data", onData);
 
-		const budget = Math.ceil(samples / concurrency) * ANSWER_BUDGET_MS + 2 * 60 * 1000;
+		// Answers plus echo probes; auto runs up to three looks back to back.
+		const budget = (Math.ceil((2 * samples) / concurrency) + (auto ? AUTO_LOOKS.length : 0)) * ANSWER_BUDGET_MS + 2 * 60 * 1000;
 		const watchdog = setTimeout(() => {
 			if (this.state === "running") {
 				this.errorMsg = `超时（${Math.round(budget / 60000)} 分钟）`;
@@ -376,7 +436,7 @@ export class FireyeOverlay implements Focusable {
 		if (!this.target.bankId) return { c: "text", t: `${n}  像 ${s.like}（${pct(s.like_p)}）${secs}` };
 		if (s.flagged) return { c: "error", t: `${n}  ✗ 明显不像标签，像 ${s.like}（${pct(s.like_p)}）${secs}` };
 		if (s.like !== this.target.bankId) return { c: "warning", t: `${n}  ≈ 更像 ${s.like}（标签 ${pct(s.p_label)}，单条不能排除）${secs}` };
-		return { c: "success", t: `${n}  ✓ 像标签${secs}` };
+		return { c: "success", t: `${n}  ✓ 像标签（${pct(s.p_label)}）${secs}` };
 	}
 
 	private runningLines(): Array<{ c: Color; t: string }> {
@@ -387,14 +447,60 @@ export class FireyeOverlay implements Focusable {
 		const valid = this.answers.filter((a) => a.assessment.valid);
 		const off = valid.filter((a) => a.assessment.flagged).length;
 		const drift = valid.filter((a) => a.assessment.like !== t.bankId).length - off;
-		const bar = "█".repeat(Math.round((got / t.samples) * 20)).padEnd(20, "░");
-		out.push({ c: "text", t: `进度  ${bar}  已收到 ${got}/${t.samples} 条回答（并行发出）` });
+		const bar = "█".repeat(Math.round((Math.min(got, this.planned) / this.planned) * 20)).padEnd(20, "░");
+		out.push({ c: "text", t: `进度  ${bar}  已收到 ${got}/${this.planned} 条回答（并行发出${t.auto ? `，自动加测最多 ${t.samples} 条` : ""}）` });
+		for (const l of this.looks) if (l.next) out.push({ c: "warning", t: `加测  ${l.n} 条时${l.reason}，加测到 ${l.next} 条` });
+		const tok = this.probeSummary();
+		if (tok) out.push(tok);
 		if (t.bankId) out.push({ c: off || drift ? "warning" : "text", t: `目前  ${valid.length - off - drift} 条像 ${t.modelId}${drift ? `，${drift} 条更像别的模型` : ""}${off ? `，${off} 条明显不像` : ""}` });
 		else out.push({ c: "warning", t: `注意  指纹库没有 ${t.modelId}，只能告诉你它像谁，不能下结论` });
+		const strip = this.likenessLines(false);
+		if (strip.length) out.push({ c: "dim", t: "" }, ...strip);
 		out.push({ c: "dim", t: "" });
 		for (const a of this.answers) out.push(this.answerLine(a));
 		if (!got) out.push({ c: "dim", t: this.lane.transport ? "等待第一条回答…（每条通常 30–120 秒）" : "连接站点、确认协议…" });
 		return out;
+	}
+
+	/** "How much like the label": send-order strip, plus the histogram once the run is over. */
+	private likenessLines(withHistogram: boolean): Array<{ c: Color; t: string }> {
+		const lk = this.likeness;
+		const bankId = this.target.bankId;
+		if (!lk || !bankId || !this.answers.length) return [];
+		const out: Array<{ c: Color; t: string }> = [];
+		const s = lk.stripText(this.answers);
+		const odd = s.marks.length > 0;
+		out.push({ c: odd ? "warning" : "success", t: `像标签  ${s.bars}` });
+		if (odd) out.push({ c: "warning", t: `        ${s.marks}` });
+		out.push({ c: "dim", t: "        按发送顺序 · █≥90% ▆50–90% ▄10–50% ▂0.1–10% ▁<0.1% · ✗明显不像 ≈更像别的模型" });
+		if (!withHistogram) return out;
+		const h = lk.histogram(this.answers, lk.cal, bankId);
+		if (!h.n) return out;
+		out.push({ c: "dim", t: "" });
+		out.push({ c: "accent", t: `分布    ${" ".repeat(8)}本次${" ".repeat(24)}${h.ref ? "真模型参考（同样条数）" : ""}` });
+		const lines = lk.histogramLines(h);
+		lines.forEach((t, i) => {
+			const r = h.rows[i];
+			// Highlight bins where this run has clearly more answers than a genuine channel would.
+			const over = r.expected != null && i > 0 && r.count >= Math.max(2, 2 * r.expected + 1);
+			out.push({ c: over ? "warning" : "text", t: `        ${t}` });
+		});
+		const note = lk.shapeNote(h);
+		if (note) out.push({ c: "warning", t: `形状    ${note}` });
+		return out;
+	}
+
+	/** Running tally of the echo probes (token counts). */
+	private probeSummary(): { c: Color; t: string } | undefined {
+		if (!this.probes.length) return undefined;
+		const hist = new Map<number, number>();
+		for (const p of this.probes) if (p.count != null) hist.set(p.count, (hist.get(p.count) ?? 0) + 1);
+		const usable = [...hist.values()].reduce((a, b) => a + b, 0);
+		const parts = [...hist.entries()].sort((a, b) => b[1] - a[1]).map(([c, n]) => `${c}×${n}`);
+		// Counts within 2 tokens of the most common one are the same tokenizer (end-of-turn tokens).
+		const top = [...hist.entries()].sort((a, b) => b[1] - a[1])[0]?.[0];
+		const odd = top == null ? 0 : [...hist.entries()].filter(([c]) => c < top - 2 || c > top + 2).reduce((a, [, n]) => a + n, 0);
+		return { c: odd ? "warning" : "dim", t: `复述  ${usable}/${this.probes.length} 次可用${parts.length ? `，输出 token 数 ${parts.join("，")}` : ""}${odd ? `（${odd} 次和多数不一样）` : ""}` };
 	}
 
 	/** Plain-language result page. */
@@ -410,6 +516,9 @@ export class FireyeOverlay implements Focusable {
 		out.push({ c: "dim", t: "" });
 		for (const w of r.why) out.push({ c: "text", t: `·  ${w}` });
 		if (this.target.bankId && this.target.bankId !== this.target.modelId) out.push({ c: "dim", t: `·  按指纹库中的 ${this.target.bankId} 核对` });
+		if (r.looks?.length) out.push({ c: "dim", t: `·  自动加测：${r.looks.map((l) => `${l.n} 条${l.next ? `（${l.reason}，加测到 ${l.next}）` : "（停止）"}`).join(" → ")}` });
+		const viz = this.likenessLines(true);
+		if (viz.length) out.push({ c: "dim", t: "" }, ...viz);
 		if (this.answers.length) {
 			out.push({ c: "dim", t: "" });
 			out.push({ c: "accent", t: "逐条" });
@@ -422,6 +531,8 @@ export class FireyeOverlay implements Focusable {
 			const injText = inj == null ? "未知" : inj < 50 ? `约 ${inj} token（基本是直连）` : `约 ${inj} token（站点在你的请求前加了提示词，按输入计费）`;
 			out.push({ c: "dim", t: `隐藏提示词  ${injText}` });
 		}
+		const tok = this.probeSummary();
+		if (tok) out.push({ c: tok.c, t: tok.t.replace(/^复述  /, "复述测试    ") });
 		if (this.reportDir) out.push({ c: "dim", t: `报告        ${this.reportDir}/report.md` });
 		return out;
 	}
@@ -457,7 +568,8 @@ export class FireyeOverlay implements Focusable {
 		const lines: string[] = [];
 		lines.push(th.fg("border", `╭${"─".repeat(innerW)}╮`));
 		const t = this.target;
-		lines.push(row(` 🔥 fireye · ${th.fg("accent", `${t.provider}/${t.modelId}`)} · ${t.depthName} ${t.samples} 条 · ${th.fg("dim", t.base)}`));
+		const size = t.auto ? `${t.depthName} ${AUTO_LOOKS.join("→")} 条` : `${t.depthName} ${t.samples} 条`;
+		lines.push(row(` 🔥 fireye · ${th.fg("accent", `${t.provider}/${t.modelId}`)} · ${size} · ${th.fg("dim", t.base)}`));
 
 		const elapsed = Math.floor(((this.finishedAt ?? Date.now()) - this.startedAt) / 1000);
 		const clock = `${Math.floor(elapsed / 60)}:${String(elapsed % 60).padStart(2, "0")}`;
