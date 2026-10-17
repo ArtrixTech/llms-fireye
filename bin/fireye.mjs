@@ -8,6 +8,7 @@ import { detectTransport, MASK } from '../lib/transport.mjs';
 import { runLane, makeSemaphore, DEPTHS, AUTO_LOOKS } from '../lib/runner.mjs';
 import { VERDICTS, loadCalibration } from '../lib/attribution.mjs';
 import { writeReport } from '../lib/report.mjs';
+import { hostOf } from '../lib/reuse.mjs';
 
 function arg(name, def) {
   const i = process.argv.indexOf(`--${name}`);
@@ -81,6 +82,7 @@ const lanes = await Promise.all(models.map(async (label) => {
   const ctx = { base, key, format: det.format, model: label, effort, thinkingMode: det.thinkingMode, timeoutMs, bank, maxTokens: 16384 };
   const lane = await runLane({
     label, labelModel, ctx, samples, auto, tokenProbes, semaphore,
+    history: { dir: outDir, host: hostOf(base) },
     onEvent: (ev) => {
       emit(ev);
       if (ev.type === 'look') { log(`look ${ev.n} answers: ${ev.verdict} k=${ev.k} j=${ev.j}${ev.next ? ` → extend to ${ev.next} (${ev.reason})` : ' → stop'}`); return; }
